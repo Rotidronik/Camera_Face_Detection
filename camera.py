@@ -1,7 +1,7 @@
 import cv2
 
 
-class CamerStream:
+class CameraStream:
     def __init__(self, source=0):
         # Ez fut le az objectum letrehotzasakor
         self.capture = cv2.VideoCapture(source)

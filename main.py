@@ -6,6 +6,10 @@ from insightface.app import FaceAnalysis
 import pyttsx3
 import time
 import threading
+import pickle
+import os
+
+DATA_FILE = "known_faces.pkl"
 # hangszoro inicializalas
 
 
@@ -82,8 +86,14 @@ app = FaceAnalysis(providers=['CPUExecutionProvider'])
 app.prepare(ctx_id=0, det_size=(640, 640))
 
 cam = CameraStream()
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "rb") as f:
+        known_faces = pickle.load(f)
+        print(f"Sikeres betöltés! {len(known_faces)} arcot már ismerek.")
+else:
+    known_faces = []
+    print("Nincs korábbi adatbázis, tiszta lappal indulunk.")
 
-known_faces = []  # list with (name, known_embedding)
 speak(text="System online", wait=False)
 
 while True:
@@ -129,8 +139,12 @@ while True:
                 speak(text=f"Welcome to the system, {name}!", wait=False)
                 new_face = faces[0].embedding
                 new_face_norm = new_face/np.linalg.norm(new_face)
+                # uj arc hozzaadasa listaba
                 known_faces.append((name, new_face_norm))
-
+                # arc lemetese fileba
+                with open(DATA_FILE, "wb") as f:
+                    pickle.dump(known_faces, f)
+                print("Arc elmentve a fileba: {name}")
             else:
                 speak(text="Sorry i didn't hear you clearly.", wait=False)
 cam.close()

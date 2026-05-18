@@ -10,26 +10,12 @@ import pickle
 import os
 
 DATA_FILE = "known_faces.pkl"
+
+# --- GLOBÁLIS ÁLLAPOTVÁLTOZÓ A SZÁLAK KÖZÖTTI KOMMUNIKÁCIÓHOZ ---
+# Ha a háttérszál nevet talál, ide készíti be a főszálnak
+trigger_training_name = None
+is_speaking = False  # Globális flag
 # hangszoro inicializalas
-
-
-def speak_logic(text):
-    """Ez a függvény végzi a tényleges beszédet (blokkoló)"""
-    try:
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices')
-
-        for voice in voices:
-            if "Hungarian" in voice.name or "hu-HU" in voice.id:
-                engine.setProperty('voice', voice.id)
-                break
-        engine.setProperty('rate', 180)  # beszedsebesség
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
-        del engine
-    except Exception as e:
-        print(f"Hiba a beszednel: {e}")
 
 
 def speak(text, wait=False):
@@ -37,9 +23,13 @@ def speak(text, wait=False):
     text: a mondandó
     wait: ha True, megvárja a végét (fagy a kép), ha False, háttérben fut (folyamatos kép)
     """
+    global is_speaking
+
     def run_speech():
         """Ez a függvény végzi a tényleges beszédet (blokkoló)"""
+        global is_speaking
         try:
+            is_speaking = True
             engine = pyttsx3.init()
             voices = engine.getProperty('voices')
 
@@ -54,31 +44,59 @@ def speak(text, wait=False):
             del engine
         except Exception as e:
             print(f"Hiba a beszednel: {e}")
+        finally:
+            time.sleep(0.2)
+            is_speaking = False
     if wait:
         run_speech()
     else:
         threading.Thread(target=run_speech).start()  # Háttérben fut
 
 
-def get_voice_input():
-    recogniser = sr.Recognizer()
-    with sr.Microphone() as source:
+def continuous_audio_listener():
+    """Ez a függvény egy külön háttérszálon fut futásidőben végig.
 
-        recogniser.adjust_for_ambient_noise(source, duration=0.1)
-        print("Figyelek... Mondd a neved!")
-        try:
-            audio = recogniser.listen(source, timeout=3, phrase_time_limit=3)
-            text = recogniser.recognize_google(audio, language='en-EN')
-            return text
-        except sr.UnknownValueError:
-            print("Sajnos nem értettem, mit mondtál.")
-            return None
-        except sr.RequestError:
-            print("Hálózati hiba a Google szolgáltatásával.")
-            return None
-        except Exception as e:
-            print(f"Hiba történt: {e}")
-            return None
+    Folyamatosan figyel a mikrofonra, és ha meghallja, hogy 'Zeus',
+    feldolgozza a nevet.
+    """
+    global trigger_training_name, is_speaking
+    recogniser = sr.Recognizer()
+    mic = sr.Microphone()
+    with mic as source:
+        recogniser.adjust_for_ambient_noise(source=source, duration=0.8)
+
+    print("-> Siri ébresztési szó figyelése elindult a háttérben...")
+    while True:
+        # Ha a főszál éppen ment egy arcot, várunk, nem szakítjuk félbe
+        if trigger_training_name is not None or is_speaking:
+            time.sleep(0.2)
+            continue
+        with mic as source:
+            try:
+                # 4s ig figyel
+                audio = recogniser.listen(
+                    source=source, timeout=2, phrase_time_limit=4)
+                text = recogniser.recognize_google(
+                    audio, language="en-US").lower()
+
+                if "siri" in text:
+                    # print("[HÁTTÉRSZÁL] Siri aktiválva!")
+                    if "my name is" in text:
+                        extracted_name = text.split(
+                            "my name is")[-1].strip()  # kiszedjuk a nevet
+                        extracted_name = (extracted_name.replace(
+                            ".", "").replace("?", "").strip())
+                        if extracted_name:
+                            # print(f"[HÁTTÉRSZÁL] Név bekészítve mentésre: {extracted_name}")
+                            trigger_training_name = (extracted_name)
+
+            except (sr.WaitTimeoutError, sr.UnknownValueError):
+                # Ha csend van vagy nem érthető a zaj, hibajelzés nélkül megy tovább a háttér ciklus
+                continue
+            except Exception as e:
+                print(f"Beszéd hiba a háttérben: {e}")
+                time.sleep(1)
+# ----------------------------------------------------------------------------------------------------
 
 
 # inicializing AI
@@ -94,9 +112,13 @@ else:
     known_faces = []
     print("Nincs korábbi adatbázis, tiszta lappal indulunk.")
 
+audio_thread = threading.Thread(target=continuous_audio_listener, daemon=True)
+audio_thread.start()
+
 speak(text="System online", wait=False)
 
 while True:
+
     frame = cam.get_frame()
     if frame is None:
         break
@@ -113,10 +135,26 @@ while True:
         for name, known_embedding in known_faces:
             # tavolsag az aktualis es imsert arc kozott
             similarity = np.dot(embed_norm, known_embedding)
-            print(f"Distance from {name}: {similarity:.4f}")
+            # print(f"Distance from {name}: {similarity:.4f}")
             if similarity > 0.5:  # ez a kuszobertek h menyi hibat engedunk tavolsagban
                 current_name = name
                 break
+        if current_name == "ismeretlen" and trigger_training_name is not None:
+            name_to_save = trigger_training_name
+            # Üdvözlés szálon (nem akasztja meg a videót)
+            speak(text=f"Welcome to the system {name_to_save}!", wait=False)
+            known_faces.append((name_to_save, embed_norm))  # RAM ba menmtjuk
+
+            # mentes a fileba
+            with open(DATA_FILE, "wb") as f:
+                pickle.dump(known_faces, f)
+            # print(f"Arc elmentve a fileba: {name_to_save}")
+            # RESET: Töröljük a triggert, hogy a következő képkockát ne mentse el újra és újra
+            trigger_training_name = None
+
+        # ha felismerjuk de megis mondott nevet
+        if current_name != "ismeretlen" and trigger_training_name is not None:
+            trigger_training_name = None
         # keret rajzolas
         bbox = face.bbox.astype(int)
         cv2.rectangle(frame, (bbox[0], bbox[1]),
@@ -129,23 +167,5 @@ while True:
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
-    elif key == ord('t'):
-        if len(faces) > 0:
-            speak(text="Tell your name into the microfone", wait=True)
-
-            name = get_voice_input()
-
-            if name:
-                speak(text=f"Welcome to the system, {name}!", wait=False)
-                new_face = faces[0].embedding
-                new_face_norm = new_face/np.linalg.norm(new_face)
-                # uj arc hozzaadasa listaba
-                known_faces.append((name, new_face_norm))
-                # arc lemetese fileba
-                with open(DATA_FILE, "wb") as f:
-                    pickle.dump(known_faces, f)
-                print("Arc elmentve a fileba: {name}")
-            else:
-                speak(text="Sorry i didn't hear you clearly.", wait=False)
 cam.close()
 cv2.destroyAllWindows()

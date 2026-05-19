@@ -12,5 +12,10 @@ class CameraStream:
             return None
         return frame
 
+    def close(self):
+        """Azonnali, parancsra történő hardver-elengedés"""
+        if self.capture is not None and self.capture.isOpened():
+            self.capture.release()
+
     def __del__(self):
-        self.capture.release()
+        self.close()

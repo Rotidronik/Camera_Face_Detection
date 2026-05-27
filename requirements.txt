@@ -3,3 +3,4 @@ pip install opencv-python
 pip install insightface onnxruntime numpy
 pip install SpeechRecognition pyaudio
 pip install pyttsx3
+pip install watchdog

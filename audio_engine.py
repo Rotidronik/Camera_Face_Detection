@@ -1,117 +1,117 @@
-import threading
 import time
+import subprocess
 import speech_recognition as sr
-import os
-from gtts import gTTS
-import pygame
+import multiprocessing
 
-trigger_training_name = None
-trigger_llm_command = None
-is_speaking = False
-pygame.mixer.init()
+RTSP_URL = "rtsp://admin:Rotidronik2002@192.168.10.120:554/h264Preview_01_sub"
+SAMPLE_RATE = 16000
+CHANNELS = 1
+
+trigger_llm_command = None  # Ez csak a főprocessben használt változó
 
 
-def speak(text, wait=False):
+def _audio_process_worker(command_queue: multiprocessing.Queue):
     """
-    Legenerálja a magyar hangot a Google TTS-sel, és lejátssza egy háttérszálon.
+    Ez a függvény egy TELJESEN KÜLÖN Python processben fut.
+    Semmi közös memória nincs az OpenCV-vel, nincs libavcodec ütközés.
     """
-    global is_speaking
+    recogniser = sr.Recognizer()
+    recogniser.energy_threshold = 5
+    recogniser.dynamic_energy_threshold = False
+    recogniser.pause_threshold = 2.0
+    recogniser.phrase_threshold = 0.1
 
-    def run_speech():
-        global is_speaking
+    print("[AUDIO PROCESS] Elindult a külön audio process.")
+
+    while True:
+        print("[AUDIO PROCESS] FFmpeg csatlakozás...")
         try:
-            is_speaking = True
+            ffmpeg_process = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-loglevel", "quiet",
+                    "-rtsp_transport", "tcp",
+                    "-i", RTSP_URL,
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", str(SAMPLE_RATE),
+                    "-ac", str(CHANNELS),
+                    "-f", "s16le",
+                    "pipe:1"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            print("[AUDIO PROCESS] FFmpeg stream aktív.")
 
-            tts = gTTS(text=text, lang='hu')
-            filename = "temp_voice.mp3"
-            tts.save(filename)
+            class RTSPAudioSource(sr.AudioSource):
+                def __init__(self):
+                    self.stream = ffmpeg_process.stdout
+                    self.CHUNK = 1024
+                    self.SAMPLE_RATE = SAMPLE_RATE
+                    self.SAMPLE_WIDTH = 2
 
-            pygame.mixer.music.load(filename)
-            pygame.mixer.music.play()
+                def __enter__(self):
+                    return self
 
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
+                def __exit__(self, exc_type, exc_val, exc_tb):
+                    pass
 
-            pygame.mixer.music.unload()
+            with RTSPAudioSource() as source:
+                print("[AUDIO PROCESS] Zajszint kalibrálása...")
+                recogniser.adjust_for_ambient_noise(source, duration=2)
+                print(
+                    f"[AUDIO PROCESS] Kalibrálás kész. Threshold: {recogniser.energy_threshold:.0f}")
+
+                while True:
+                    if ffmpeg_process.poll() is not None:
+                        print("[AUDIO PROCESS] FFmpeg leállt, újracsatlakozás...")
+                        break
+                    try:
+                        audio = recogniser.listen(
+                            source, timeout=10, phrase_time_limit=10)
+                        text = recogniser.recognize_google(
+                            audio, language="hu-HU").lower()
+
+                        if "zeusz" not in text:
+                            continue
+
+                        print(f"[AUDIO PROCESS] Zeusz megszólítva: '{text}'")
+                        command_queue.put(text)  # Átadjuk a főprocessnek
+
+                    except sr.WaitTimeoutError:
+                        continue
+                    except sr.UnknownValueError:
+                        continue
+                    except sr.RequestError as e:
+                        print(f"[AUDIO PROCESS] Google STT hiba: {e}")
+                        time.sleep(2)
+                    except Exception as e:
+                        print(f"[AUDIO PROCESS] Hiba: {e}")
+                        break
+
+        except Exception as e:
+            print(f"[AUDIO PROCESS] Stream hiba: {e}")
+        finally:
             try:
-                os.remove(filename)
+                ffmpeg_process.kill()
             except:
                 pass
 
-        except Exception as e:
-            print(f"Hiba a gTTS beszednel: {e}")
-        finally:
-            time.sleep(0.8)
-            is_speaking = False
-
-    if wait:
-        run_speech()
-    else:
-        threading.Thread(target=run_speech).start()
+        time.sleep(3)
 
 
-def start_audio_thread():
+def start_audio_process():
     """
-    listen_in_background-ot használ, hogy soha ne legyen vak folt a figyelésben.
-    A callback minden felismert mondat után azonnal lefut.
+    Elindít egy teljesen külön Python processzt az audio kezeléshez.
+    Visszaad egy Queue-t amin keresztül a főprocess megkapja a parancsokat.
     """
-    global trigger_training_name, trigger_llm_command
-
-    recogniser = sr.Recognizer()
-    mic = sr.Microphone()
-
-    # Zajszint kalibrálás induláskor
-    print("-> Mikrofon kalibrálása...")
-    with mic as source:
-        recogniser.adjust_for_ambient_noise(source=source, duration=1.5)
-    print("-> Kalibrálás kész.")
-
-    def callback(recogniser, audio):
-        global trigger_training_name, trigger_llm_command, is_speaking
-
-        # Ha Zeusz éppen beszél, ne hallja meg a saját hangját
-        if is_speaking:
-            return
-
-        try:
-            text = recogniser.recognize_google(audio, language="hu-HU").lower()
-
-            # Csak Zeusz megszólítására reagálunk
-            if "zeusz" not in text:
-
-                return
-            print(f"[MIC] Hallottam: '{text}'")
-            # Névregisztráció parancs
-            if "az én nevem" in text or "nevem" in text:
-                if "az én nevem" in text:
-                    extracted_name = text.split("az én nevem")[-1].strip()
-                else:
-                    extracted_name = text.split("nevem")[-1].strip()
-
-                extracted_name = extracted_name.replace(
-                    ".", "").replace("?", "").strip()
-
-                if extracted_name:
-                    print(f"[MIC] Név bekészítve: '{extracted_name}'")
-                    trigger_training_name = extracted_name
-
-            else:
-                # Minden más Zeusznak szóló mondat parancsként megy az LLM-nek
-                print(f"[MIC] Parancs bekészítve: '{text}'")
-                trigger_llm_command = text
-
-        except sr.UnknownValueError:
-            # Érthetetlen zaj, csendben továbblépünk
-            pass
-        except sr.RequestError as e:
-            print(f"[MIC] Google STT hiba: {e}")
-        except Exception as e:
-            print(f"[MIC] Ismeretlen hiba: {e}")
-
-    # Folyamatos háttérfigyelés indítása - soha nem áll le, nincsenek vak foltok
-    stop_listening = recogniser.listen_in_background(
-        mic, callback, phrase_time_limit=8)
-    print("-> 'Zeusz' ébresztési szó figyelése elindult a háttérben...")
-
-    # A stop_listening függvényt visszaadhatnánk ha le akarjuk állítani később,
-    # de egy végtelen futású alkalmazásnál erre nincs szükség.
+    command_queue = multiprocessing.Queue()
+    p = multiprocessing.Process(
+        target=_audio_process_worker,
+        args=(command_queue,),
+        daemon=True
+    )
+    p.start()
+    print("[AUDIO] Külön audio process elindítva.")
+    return command_queue

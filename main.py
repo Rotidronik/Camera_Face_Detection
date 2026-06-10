@@ -1,164 +1,143 @@
 import cv2
 import numpy as np
-import threading
+import time
+import requests
 import multiprocessing
-from camera import CameraStream
-import audio_engine
+import threading  # Új import az aszinkron makróhoz
 import vision_engine
 import LLM_engine
+import audio_engine
+from camera import CameraStream
 
 
-trigger_parsed_json = None
-llm_is_processing = False
+# Állapotváltozó, hogy ne lehessen kétszer egyszerre elindítani a makrót
+macro_is_running = False
 
 
-def async_llm_worker(user_name, command_text):
-    global trigger_parsed_json, llm_is_processing
+def send_gate_command_to_ha():
+    """Nyers Broadlink RF jel kiküldése a Home Assistantnak."""
     try:
-        llm_is_processing = True
-        print(f"[LLM SZÁL] Ollama hívás indítva: '{command_text}'...")
-        parsed_json = LLM_engine.parse_command(user_name, command_text)
-        print(f"[LLM SZÁL] Ollama végzett! Kapott JSON: {parsed_json}")
-        trigger_parsed_json = parsed_json
+        url = f"{HA_URL}/api/services/remote/send_command"
+        payload = {
+            "entity_id": "remote.broadlink_kapu_nyito",
+            "device": "roger_kapu",
+            "command": "open"
+        }
+        response = requests.post(url, json=payload, headers=HEADERS, timeout=2)
+        return response.status_code in [200, 201]
     except Exception as e:
-        print(f"Hiba a háttér LLM szálon: {e}")
-    finally:
-        llm_is_processing = False
+        print(f"[HA API TRANSPORT HIBA] {e}")
+        return False
 
 
-def control_smart_home(json_data):
-    device = json_data.get("device")
-    action = json_data.get("action")
-    user = json_data.get("user")
+def automated_gate_sequence():
+    """
+    Aszinkron háttérszál, ami levezényli a Nyitás -> Megállítás -> Zárás szekvenciát
+    anélkül, hogy a fő arcfelismerő programot leblokkolná.
+    """
+    global macro_is_running
+    macro_is_running = True
 
-    if device == "none" or action == "unknown":
-        print(f"[RENDSZER] Ismeretlen parancs, nincs művelet.")
-        return
+    print("\n=======================================================")
+    print("[MAKRÓ] ---> AUTOMATIZÁLT KAPU SZEKVENCIA ELINDULT <---")
+    print("=======================================================")
 
-    if device in ["nagykapu", "kapu"]:
-        if action == "open":
-            print(
-                f"[HARDVER JEL] ---> RELÉ_1 (KAPU) -> HIGH | Felhasználó: {user}")
-        elif action == "close":
-            print(
-                f"[HARDVER JEL] ---> RELÉ_1 (KAPU) -> LOW | Felhasználó: {user}")
-    elif device == "redőny":
-        if action == "close":
-            print(
-                f"[HARDVER JEL] ---> MOTOR_2 (REDŐNY) -> DOWN | Felhasználó: {user}")
-        elif action == "open":
-            print(
-                f"[HARDVER JEL] ---> MOTOR_2 (REDŐNY) -> UP | Felhasználó: {user}")
-    elif device == "lámpa":
-        if action == "on":
-            print(
-                f"[HARDVER JEL] ---> RELÉ_3 (LÁMPA) -> ON | Felhasználó: {user}")
-        elif action == "off":
-            print(
-                f"[HARDVER JEL] ---> RELÉ_3 (LÁMPA) -> OFF | Felhasználó: {user}")
+    # 1. LÉPÉS: Nyitás indítása
+    print("[MAKRÓ] 1/3: Első jel kiküldése -> Kapu NYITÁSA elindult...")
+    send_gate_command_to_ha()
+
+    # Várakozás, amíg a kapu kinyílik annyira, hogy kényelmesen be lehessen férni (1.5 másodperc)
+    time.sleep(20)
+
+    # 2. LÉPÉS: Kapu megállítása részlegesen nyitott állapotban
+    print("[MAKRÓ] 2/3: Második jel kiküldése -> Kapu MEGÁLLÍTÁSA...")
+    send_gate_command_to_ha()
+
+    # Áthaladási időablak: Ennyi ideig áll nyitva a kapu, amíg átsétálsz/bemész a kocsival (7 másodperc)
+    print("[MAKRÓ] Várakozás az áthaladásra (7 másodperc)...")
+    time.sleep(10.0)
+
+    # 3. LÉPÉS: Kapu bezárása
+    print("[MAKRÓ] 3/3: Harmadik jel kiküldése -> Kapu ZÁRÁSA...")
+    send_gate_command_to_ha()
+
+    print("=======================================================")
+    print("[MAKRÓ] ---> AUTOMATIZÁLT KAPU SZEKVENCIA KÉSZ <---")
+    print("=======================================================\n")
+    macro_is_running = False
 
 
 # ============================================================
-# MULTIPROCESSING - Windows alatt kötelező ez a guard!
+# FŐPROGRAM
 # ============================================================
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
-    # Rendszerek indítása
+    print("[RENDSZER] Zeusz 4.1 (Aszinkron Makró Verzió) indul...")
+
+    # AI modulok és hardveres kapcsolatok felélesztése
     face_app = vision_engine.init_face_analysis()
     known_faces = vision_engine.load_known_faces()
-
-    # Automatikus arc betanítás a 'faces' mappából
     known_faces = vision_engine.auto_register_from_folder(
         face_app, known_faces)
     vision_engine.start_faces_watcher(face_app, known_faces)
 
     cam = CameraStream()
-
-    # Audio külön processben indul - visszaad egy Queue-t
     command_queue = audio_engine.start_audio_process()
 
-    print("[RENDSZER] Zeusz online. Ismert arcokat várok a kamera előtt...")
+    last_authorized_time = 0
+    loop_counter = 0
 
-    frame_counter = 0
-    faces = []
+    print("[RENDSZER] Zeusz online. Valós idejű figyelés aktív. Makró parancsra vár...")
 
-    # ============================================================
-    # FŐCIKLUS
-    # ============================================================
     while True:
         frame = cam.get_frame()
         if frame is None:
+            time.sleep(0.05)
             continue
 
-        # Arcfelismerés csak minden 5. képkockán
-        frame_counter += 1
-        if frame_counter % 5 == 0:
+        loop_counter += 1
+
+        # Arcfelismerés futtatása ~0.3 másodpercenként
+        if loop_counter % 3 == 0:
             faces = face_app.get(frame)
+            if len(faces) > 0:
+                face = faces[0]
+                embedding = face.embedding
+                embedding_norm = embedding / np.linalg.norm(embedding)
 
-        current_name = "ismeretlen"
-        latest_embed_norm = None
+                for name, known_embedding in known_faces:
+                    similarity = np.dot(embedding_norm, known_embedding)
+                    if similarity > 0.5:
+                        if time.time() - last_authorized_time > 15:
+                            print(
+                                f"[BIZTONSÁG] ✓ Arc azonosítva: Szia {name}! Rendszer élesítve...")
+                        last_authorized_time = time.time()
+                        break
 
-        if len(faces) > 0:
-            face = faces[0]
-            embedding = face.embedding
-            latest_embed_norm = embedding / np.linalg.norm(embedding)
+        # Hangparancsok ellenőrzése
+        if not command_queue.empty():
+            raw_command = command_queue.get_nowait()
+            print(
+                f"[FŐSZÁL] Feldolgozandó hangparancs érkezett: '{raw_command}'")
 
-            for name, known_embedding in known_faces:
-                similarity = np.dot(latest_embed_norm, known_embedding)
-                if similarity > 0.5:
-                    current_name = name
-                    break
+            if time.time() - last_authorized_time < 15:
+                print("[LLM] Nyelvi modell (Ollama) elemzés...")
+                parsed_json = LLM_engine.parse_command("robi", raw_command)
 
-            # =========================================================
-            # Parancs olvasása a Queue-ból (nem blokkol!)
-            # =========================================================
-            raw_command = None
-            if not command_queue.empty():
-                raw_command = command_queue.get_nowait()
-
-            # =========================================================
-            # ISMERT ARC: parancs végrehajtása
-            # =========================================================
-            if current_name != "ismeretlen":
-                if raw_command is not None and not llm_is_processing:
-                    threading.Thread(
-                        target=async_llm_worker,
-                        args=(current_name, raw_command),
-                        daemon=True).start()
-
-                if trigger_parsed_json is not None:
-                    parsed_json = trigger_parsed_json
-                    trigger_parsed_json = None
-                    control_smart_home(parsed_json)
-
-            # =========================================================
-            # ISMERETLEN ARC: parancsot eldobjuk
-            # =========================================================
+                if parsed_json and parsed_json.get("device") == "kapu":
+                    # Megnézzük, hogy nem fut-e már a makró, nehogy egymásra küldje a jeleket
+                    if not macro_is_running:
+                        print(
+                            f"[REAKCIÓ] Kapu szándék észlelve. Makró szál indítása!")
+                        # ELINDÍTJUK A SZEKVENCIÁT EGY KÜLÖNÁLLÓ HÁTTÉRSZÁLON
+                        threading.Thread(
+                            target=automated_gate_sequence, daemon=True).start()
+                    else:
+                        print(
+                            "[RENDSZER] A kapu automatizálási sorozat már folyamatban van, parancs blokkolva.")
             else:
-                if raw_command is not None:
-                    print(
-                        "[RENDSZER] Ismeretlen arc adott parancsot, figyelmen kívül hagyva.")
+                print(
+                    "[BLOKKOLÁS] Elhangzott a parancs, de nincs ismert arc az elmúlt 15 másodpercben.")
 
-            # =========================================================
-            # GRAFIKA
-            # =========================================================
-            bbox = face.bbox.astype(int)
-            color = (0, 255, 0) if current_name != "ismeretlen" else (0, 0, 255)
-            cv2.rectangle(frame, (bbox[0], bbox[1]),
-                          (bbox[2], bbox[3]), color, 2)
-            cv2.putText(frame, current_name, (bbox[0], bbox[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-
-            status = "Zeusz gondolkodik..." if llm_is_processing else "Zeusz figyel"
-            status_color = (0, 0, 255) if llm_is_processing else (0, 255, 0)
-            cv2.putText(frame, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-
-        cv2.imshow("Zeusz - Kapuvezérlő", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
-    cam.close()
-    cv2.destroyAllWindows()
+        time.sleep(0.1)
